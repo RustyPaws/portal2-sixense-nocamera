@@ -1,0 +1,14 @@
+# build output
+hand/out/
+*.obj
+*.lib
+*.exp
+*.pdb
+
+# never commit game binaries / dumps / logs
+*.dll
+*.dll.orig
+*.mdmp
+*.log
+
+__pycache__/
