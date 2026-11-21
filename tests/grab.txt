@@ -1,0 +1,36 @@
+# Grab test: cube in front of the player, close the hand, lift, release.
+# Uses the same values the mouse hand sends (open 2 / state 2 while held).
+log 250
+jitter 0.0005
+cmd script_execute nocam_test
+wait 8000
+cmd script TestPlayer()
+cmd script TestPlace("scaled_cube_dropper_1-cube_dropper_box", 60, 30)
+wait 1500
+cmd script TestLook("scaled_cube_dropper_1-cube_dropper_box")
+wait 500
+cmd script TestWhere("scaled_cube_dropper_1-cube_dropper_box")
+cmd script TestPlayer()
+cmd jpeg
+wait 300
+mark close hand
+open 2 2
+wait 1500
+cmd script TestWhere("scaled_cube_dropper_1-cube_dropper_box")
+cmd jpeg
+wait 300
+mark lift hand
+hand 0 0.05 0.45
+wait 300
+hand 0 0.10 0.45
+wait 300
+hand 0 0.15 0.45
+wait 1000
+cmd script TestWhere("scaled_cube_dropper_1-cube_dropper_box")
+cmd jpeg
+wait 300
+mark open hand
+open 100 2
+wait 1500
+cmd script TestWhere("scaled_cube_dropper_1-cube_dropper_box")
+quit

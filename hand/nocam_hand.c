@@ -14,15 +14,9 @@
  *    handler (vt+0x30 = 0x103FEC10) every frame.
  *  - That handler gets PXCGesture* from object+0x1048 and calls
  *    QueryNodeData(user, label, GeoNode*) (vtable slot 7, stdcall).
- *    We put a fake PXCGesture there whose QueryNodeData reports a hand
- *    driven by mouse/keyboard.
- *
- * Controls (only while the game window is focused):
- *   hold ALT            hand is present and CLOSED (grab); mouse moves hand
- *                       (view does not turn), wheel = closer/further
- *   hold ALT + R        mouse tilts the hand (rotate), wheel rolls it
- *                       (key configurable: rotate_key in nocam_hand.ini)
- *   release ALT         hand opens (release); hand returns to centre
+ *    We put a fake PXCGesture there whose QueryNodeData reports the hand
+ *    seen by the webcam tracker (tracker/tracker.py, shared memory
+ *    "nocam_hand"). Without the tracker no hand is visible.
  *
  * GeoNode fields used by the game (reverse engineered):
  *   +0x04 label, +0x10 timestamp, +0x18/1C/20 world pos (x, depth, up; m),
@@ -39,31 +33,53 @@
 static BYTE *g_client;
 #define VA(x) ((void *)(g_client + ((DWORD)(x) - CLIENT_BASE)))
 
+/* ------------------------------------------------ in-memory camera patches */
+/* client_sixense.dll stays the original file on disk; these are applied to  */
+/* the loaded image from DllMain, before any of its code runs. `reloc` is the */
+/* offset of an absolute address inside `orig` that the loader has already  */
+/* rebased (-1 if none). New bytes contain no absolute addresses.           */
+typedef struct {
+    const char *name; DWORD va; int len, reloc;
+    BYTE orig[8], patch[8];
+} MemPatch;
+
+static const MemPatch g_mem_patches[] = {
+    { "A: skip Intel pipeline creation at startup", 0x10402B21, 6, -1,
+      { 0x0F, 0x84, 0x16, 0x02, 0x00, 0x00 }, { 0xE9, 0x17, 0x02, 0x00, 0x00, 0x90 } },
+    { "B: no periodic camera reconnect attempt",   0x103FFD07, 6, 2,
+      { 0x8B, 0x0D, 0x84, 0xAA, 0x9E, 0x10 }, { 0xE9, 0xEC, 0x00, 0x00, 0x00, 0x90 } },
+    { "C: create-pipeline-if-missing does nothing", 0x103FFA52, 6, -1,
+      { 0x0F, 0x85, 0xD2, 0x00, 0x00, 0x00 }, { 0xE9, 0xD3, 0x00, 0x00, 0x00, 0x90 } },
+    { "D: camera-present check always true",       0x103EC2C0, 6, 1,
+      { 0xA1, 0x9C, 0x3E, 0xA6, 0x10, 0x85 }, { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 } },
+    { "F: never recreate pipeline on frame-rate change", 0x103FEFFF, 6, -1,
+      { 0x0F, 0x84, 0x2B, 0x01, 0x00, 0x00 }, { 0xE9, 0x2C, 0x01, 0x00, 0x00, 0x90 } },
+};
+
+static void apply_mem_patches(void);   /* defined after dbg() */
+
 #define G_PIPELINE        0x10A63E9C   /* CSixenseUtilPipeline* (gesture) */
 #define FN_ALLOC          0x1015BAC0   /* void* __cdecl alloc(size)       */
 #define FN_PIPELINE_CTOR  0x103FE860   /* __thiscall ctor                 */
 #define PIPELINE_SIZE     0x2948
 #define OFF_UTIL_VTBL     0x1F80       /* UtilPipeline sub-object         */
 #define OFF_GESTURE_PTR   0x1048       /* PXCGesture* returned by QueryGesture */
+/* Depth image size (UtilPipeline +0xF48 sub-object, +0x9C0/+0x9C4). The frame
+ * handler (0x103FED68) clears "fingertip inside the image" (0x10A63B10) when
+ * it is 0, and without that flag a closed hand never grabs (0x103FBB61).    */
+#define OFF_IMAGE_W       0x2940
+#define OFF_IMAGE_H       0x2944
+#define IMAGE_W           320          /* matches the image coords we send */
+#define IMAGE_H           240
 
 /* ---------------------------------------------------------------- tunables */
-static float cfg_move_scale  = 0.0006f;  /* metres per mouse count          */
-static float cfg_depth_step  = 0.03f;    /* metres per wheel notch          */
-static float cfg_tilt_scale  = 0.004f;   /* radians per mouse count         */
-static float cfg_roll_step   = 0.15f;    /* radians per wheel notch         */
-static float cfg_rest_depth  = 0.45f;    /* hand distance from camera (m)   */
-static int   cfg_hand_always = 1;        /* report open hand when ALT up    */
 static int   cfg_log_nodes   = 0;
-static int   cfg_rotate_vk   = 'R';      /* hold with ALT to rotate instead of move */
-static int   cfg_alt_open    = 1;        /* 1: every ALT grab is rotate-capable     */
 static int   cfg_hold_open   = 2;        /* openness sent while holding+rotatable   */
-/* axis signs (+1/-1). Game mirrors world x, so mouse-right needs -x. */
-static float sx_move = -1.f, sy_move = 1.f, sx_tilt = 1.f, sy_tilt = 1.f;
+static float cfg_tip_height  = 0.045f;   /* fingertip this far above the palm (m): it
+                                            aims the portal gun; 0.08 points it upwards */
 
 /* ---------------------------------------------------------- shared state */
-static volatile LONG g_alt, g_shift;
 static CRITICAL_SECTION g_cs;
-static float h_x, h_up, h_depth, h_tilt_x, h_tilt_up, h_roll;
 static FILE *g_log;
 static char g_dir[MAX_PATH];
 
@@ -78,71 +94,44 @@ static void dbg(const char *fmt, ...)
     fflush(g_log);
 }
 
-static float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
-
-static void hand_reset(void)
+static void apply_mem_patches(void)
 {
-    h_x = 0; h_up = 0; h_depth = cfg_rest_depth;
-    h_tilt_x = 0; h_tilt_up = 0; h_roll = 0;
-}
+    static int done;
+    enum { n = sizeof g_mem_patches / sizeof g_mem_patches[0] };
+    DWORD delta = (DWORD)g_client - CLIENT_BASE;
+    BYTE want[n][8];
+    int i, bad = 0;
 
-static int game_focused(void)
-{
-    DWORD pid = 0;
-    HWND w = GetForegroundWindow();
-    if (!w) return 0;
-    GetWindowThreadProcessId(w, &pid);
-    return pid == GetCurrentProcessId();
-}
-
-/* ------------------------------------------------------- input (LL hook) */
-static LRESULT CALLBACK mouse_ll(int code, WPARAM wp, LPARAM lp)
-{
-    if (code == HC_ACTION && game_focused() && (GetAsyncKeyState(VK_MENU) & 0x8000)) {
-        MSLLHOOKSTRUCT *m = (MSLLHOOKSTRUCT *)lp;
-        int shift = (GetAsyncKeyState(cfg_rotate_vk) & 0x8000) != 0;   /* rotate modifier */
-        if (m->flags & LLMHF_INJECTED)
-            return CallNextHookEx(NULL, code, wp, lp);
-        if (wp == WM_MOUSEMOVE) {
-            POINT c;
-            GetCursorPos(&c);
-            {
-                float dx = (float)(m->pt.x - c.x), dy = (float)(m->pt.y - c.y);
-                EnterCriticalSection(&g_cs);
-                if (shift) {
-                    h_tilt_x  = clampf(h_tilt_x  + sx_tilt * dx * cfg_tilt_scale, -1.2f, 1.2f);
-                    h_tilt_up = clampf(h_tilt_up - sy_tilt * dy * cfg_tilt_scale, -1.2f, 1.2f);
-                } else {
-                    h_x  = clampf(h_x  + sx_move * dx * cfg_move_scale, -0.30f, 0.30f);
-                    h_up = clampf(h_up - sy_move * dy * cfg_move_scale, -0.25f, 0.25f);
-                }
-                LeaveCriticalSection(&g_cs);
-            }
-            return 1;   /* swallow: the view must not turn while ALT is held */
-        }
-        if (wp == WM_MOUSEWHEEL) {
-            float notches = (float)(short)HIWORD(m->mouseData) / WHEEL_DELTA;
-            EnterCriticalSection(&g_cs);
-            if (shift) h_roll = clampf(h_roll + notches * cfg_roll_step, -1.5f, 1.5f);
-            else       h_depth = clampf(h_depth - notches * cfg_depth_step, 0.20f, 0.80f);
-            LeaveCriticalSection(&g_cs);
-            return 1;
+    if (done || !g_client) return;
+    done = 1;
+    /* verify every site first: all or nothing */
+    for (i = 0; i < n; i++) {
+        const MemPatch *p = &g_mem_patches[i];
+        const BYTE *cur = (const BYTE *)VA(p->va);
+        memcpy(want[i], p->orig, p->len);
+        if (p->reloc >= 0) *(DWORD *)(want[i] + p->reloc) += delta;
+        if (memcmp(cur, p->patch, p->len) == 0) continue;          /* patched on disk */
+        if (memcmp(cur, want[i], p->len) != 0) {
+            dbg("mem patch %s: unexpected bytes %02x %02x %02x %02x %02x %02x", p->name,
+                cur[0], cur[1], cur[2], cur[3], cur[4], cur[5]);
+            bad = 1;
         }
     }
-    return CallNextHookEx(NULL, code, wp, lp);
-}
-
-static DWORD WINAPI input_thread(LPVOID p)
-{
-    MSG msg;
-    HHOOK h = SetWindowsHookExA(WH_MOUSE_LL, mouse_ll, GetModuleHandleA(NULL), 0);
-    dbg("mouse hook %s", h ? "installed" : "FAILED");
-    (void)p;
-    while (GetMessageA(&msg, NULL, 0, 0) > 0) {
-        TranslateMessage(&msg);
-        DispatchMessageA(&msg);
+    if (bad) { dbg("different client_sixense.dll version - camera patches NOT applied"); return; }
+    for (i = 0; i < n; i++) {
+        const MemPatch *p = &g_mem_patches[i];
+        BYTE *at = (BYTE *)VA(p->va);
+        DWORD old;
+        if (memcmp(at, p->patch, p->len) == 0) { dbg("mem patch %s: already in file", p->name); continue; }
+        if (!VirtualProtect(at, p->len, PAGE_EXECUTE_READWRITE, &old)) {
+            dbg("mem patch %s: VirtualProtect failed (%lu)", p->name, GetLastError());
+            continue;
+        }
+        memcpy(at, p->patch, p->len);
+        VirtualProtect(at, p->len, old, &old);
+        dbg("mem patch %s: applied at %p", p->name, at);
     }
-    return 0;
+    FlushInstructionCache(GetCurrentProcess(), NULL, 0);
 }
 
 /* ------------------------------------------------------ fake PXCGesture */
@@ -150,82 +139,164 @@ typedef struct { void **vtbl; } FakeObj;
 static void *g_gesture_vtbl[32];
 static FakeObj g_gesture = { g_gesture_vtbl };
 
+/* ------------------------------------------- webcam tracker (tracker.py) */
+/* Shared memory written by tracker/tracker.py - keep layouts in sync.     */
+#pragma pack(push, 1)
+typedef struct {
+    DWORD magic;               /* 'NCH1'                                    */
+    volatile DWORD seq;        /* odd while the tracker is writing          */
+    ULONGLONG tick_ms;         /* GetTickCount64 at write                   */
+    int valid, closed, openness;
+    float hand[3], tip[3], upper[3], normal[3];   /* (right, up, depth)     */
+    DWORD cfg_magic;           /* 'NCC1': live settings below are valid      */
+    float tip_height;          /* overrides nocam_hand.ini while tracking    */
+    int toggle_grab;
+} CamShm;
+#pragma pack(pop)
+#define CAM_MAGIC 0x3148434Eu
+#define CAM_CFG_MAGIC 0x3143434Eu
+static int cfg_camera_timeout = 300;          /* ms before data is stale  */
+static const CamShm *g_cam;
+
+static void put3(BYTE *p, float a, float b, float c);
+static int player_holds(void);
+#include "nocam_test.inc.c"
+
+static int cam_read(CamShm *out)
+{
+    static ULONGLONG next_try;
+    int i;
+    if (t_on && t_source == 1) return test_cam(out);   /* scripted tracker */
+    if (!g_cam) {
+        HANDLE m;
+        ULONGLONG now = GetTickCount64();
+        if (now < next_try) return 0;
+        next_try = now + 1000;                    /* tracker not running yet */
+        m = OpenFileMappingA(FILE_MAP_READ, FALSE, "nocam_hand");
+        if (!m) return 0;
+        g_cam = (const CamShm *)MapViewOfFile(m, FILE_MAP_READ, 0, 0, sizeof(CamShm));
+        if (!g_cam) return 0;
+        dbg("webcam tracker connected");
+    }
+    for (i = 0; i < 4; i++) {                     /* seqlock read            */
+        DWORD s = g_cam->seq;
+        if (s & 1) continue;
+        MemoryBarrier();
+        *out = *g_cam;
+        MemoryBarrier();
+        if (g_cam->seq == s) break;
+    }
+    if (i == 4 || out->magic != CAM_MAGIC) return 0;
+    if (GetTickCount64() - out->tick_ms > (ULONGLONG)cfg_camera_timeout) return 0;   /* stale */
+    return out->valid ? 1 : -1;                   /* -1: tracker running, no hand */
+}
+
 static void put3(BYTE *p, float a, float b, float c)
 {
     ((float *)p)[0] = a; ((float *)p)[1] = b; ((float *)p)[2] = c;
 }
 
+/* The game only takes a new hand frame when the position changed (a real
+ * camera always jitters), so a still hand would never open or close. Every
+ * frame alternates the position by +-0.3 mm.                               */
+static int g_flip;
+#define JITTER (g_flip ? 0.0003f : -0.0003f)
+
+/* Grab logic of the game (reverse engineered, 0x103FBAD1 / 0x1040098E):
+ *  - an OPEN hand (state 2, averaged openness above a threshold) arms it;
+ *  - a CLOSED hand (state 1) for > hand_close_time then presses USE once,
+ *    which in Portal toggles: picks up, or drops what is held;
+ *  - a held object rotates only with state 2 and openness > 0.5 (we send 2,
+ *    which the game scales to 1).
+ * So the original is "close = grab, open = keep holding/rotate, close again =
+ * drop" (toggle_grab=1). Default: hold-to-carry - while closed we report 2/2
+ * once something is held, and on opening we re-arm and pulse "closed" until
+ * the object is dropped. Nothing is ever grabbed by opening the hand.       */
+static int cfg_toggle_grab = 0;
+typedef void *(__cdecl *getplayer_t)(int slot);
+typedef void *(__cdecl *getheld_t)(void *player);
+
+static int player_holds(void)            /* main thread only */
+{
+    __try {
+        void *pl = ((getplayer_t)VA(0x1008BC60))(-1);
+        return pl && ((getheld_t)VA(0x103B7320))(pl) != NULL;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+static void grab_values(int closed, DWORD *open, DWORD *state)
+{
+    int held, armed;
+    if (cfg_toggle_grab) {
+        if (closed) { *open = 0; *state = 1; } else { *open = 100; *state = 2; }
+        return;
+    }
+    held = player_holds();
+    armed = *(volatile BYTE *)VA(0x10A63E96);
+    if (closed && held)              { *open = (DWORD)cfg_hold_open; *state = 2; }  /* carry */
+    else if (closed)                 { *open = 0;   *state = 1; }  /* grab / carry  */
+    else if (held && armed)          { *open = 0;   *state = 1; }  /* drop pulse    */
+    else                             { *open = 100; *state = 2; }  /* open / re-arm */
+}
+
 static int __stdcall gesture_QueryNodeData(void *self, int user, DWORD label, BYTE *node)
 {
-    static LONG prev_alt;
     DWORD side = label & 0xFFFF0000u, part = label & 0xFFFFu;
-    int alt = (GetAsyncKeyState(VK_MENU) & 0x8000) && game_focused();
-    float x, up, depth, tx, tu, roll, px, pu;
+    CamShm c;
+    float p[3], d, ux, uy, ul;
+    DWORD open, state;
     (void)self; (void)user;
 
     if (!node) return -1;
     if (side != 0x40000u) return -3;            /* only the primary hand   */
-    if (!alt && !cfg_hand_always) return -3;    /* no hand in front of cam */
-
-    EnterCriticalSection(&g_cs);
-    if (part == 0 && alt != prev_alt) {         /* edge: re-centre hand    */
-        hand_reset();
-        prev_alt = alt;
+    if (part == 0) g_flip = !g_flip;
+    {
+        int r;
+        if (test_query(label, node, &r)) return r; /* NOCAM_TEST script hand */
     }
-    x = h_x; up = h_up; depth = h_depth; tx = h_tilt_x; tu = h_tilt_up; roll = h_roll;
-    LeaveCriticalSection(&g_cs);
-
-    px = x; pu = up;
-    if (part == 6) {            /* fingertip: 8 cm "above" the palm, rolled */
-        px += -sinf(roll) * 0.08f; pu += cosf(roll) * 0.08f;
-    } else if (part == 7) {     /* upper hand: 5 cm above, rolled           */
-        px += -sinf(roll) * 0.05f; pu += cosf(roll) * 0.05f;
+    if (cam_read(&c) != 1) return -3;           /* no tracker / no hand    */
+    if (c.cfg_magic == CAM_CFG_MAGIC) {         /* live settings from the tracker window */
+        cfg_tip_height = c.tip_height;
+        cfg_toggle_grab = c.toggle_grab;
     }
 
+    /* Fingertip/upper: a fixed length from the palm towards the knuckles
+       (keeps roll). The real index fingertip points down in a fist and far
+       up with an open hand, which tips the portal gun.                    */
+    ux = c.upper[0] - c.hand[0]; uy = c.upper[1] - c.hand[1];
+    ul = sqrtf(ux * ux + uy * uy);
+    if (ul < 1e-4f) { ux = 0.f; uy = 1.f; } else { ux /= ul; uy /= ul; }
+    p[0] = c.hand[0] + JITTER; p[1] = c.hand[1]; p[2] = c.hand[2];
+    if (part == 6)      { p[0] += ux * cfg_tip_height;          p[1] += uy * cfg_tip_height; }
+    else if (part == 7) { p[0] += ux * cfg_tip_height * 0.625f; p[1] += uy * cfg_tip_height * 0.625f; }
+    d = p[2] > 0.05f ? p[2] : 0.05f;
+
+    /* node space = (-right, depth, up); the game mirrors world x */
     memset(node, 0, 0x80);
     *(DWORD *)(node + 0x04) = label;
-    *(ULONGLONG *)(node + 0x10) = GetTickCount64() * 10000ull;
-    put3(node + 0x18, px, depth, pu);                               /* world  */
-    put3(node + 0x24, 160.0f - px / depth * 224.0f,                 /* image  */
-                      120.0f - pu / depth * 224.0f, depth * 1000.0f);
-    {   /* palm normal points back at the camera, tilted by SHIFT+mouse      */
-        float nx = sinf(tx), nz = sinf(tu), ny = -cosf(tx) * cosf(tu);
-        put3(node + 0x58, nx, ny, nz);
-    }
-    /* The game grabs while (averaged) openness <= 1 (portal_fire_hand_closed)
-     * but only rotates a held object when openness > rot_req_openness (0.5)
-     * AND the state is "open". openness 1 + state open satisfies both, so
-     * ALT+R keeps holding and enables rotation.                            */
-    {
-        /* The game decides at grab time whether a hold may rotate, so with
-         * alt_open=1 every ALT grab uses the rotate-capable values and the
-         * mouse hook alone decides move (ALT) vs rotate (ALT+R).           */
-        int rot = alt && (cfg_alt_open || (GetAsyncKeyState(cfg_rotate_vk) & 0x8000));
-        /* game scales openness by ~0.9 and truncates: 2 -> 1 (holds: <=1, and
-         * rotates: >0.5). 1 would become 0 and never rotate.               */
-        *(DWORD *)(node + 0x64) = rot ? (DWORD)cfg_hold_open : alt ? 0 : 100;
-        *(DWORD *)(node + 0x68) = (alt && !rot) ? 1 : 2;     /* 1 closed, 2 open */
-    }
-    *(DWORD *)(node + 0x70) = 100;              /* confidence-ish           */
+    *(ULONGLONG *)(node + 0x10) = c.tick_ms * 10000ull;
+    put3(node + 0x18, -p[0], p[2], p[1]);
+    put3(node + 0x24, 160.0f + p[0] / d * 224.0f, 120.0f - p[1] / d * 224.0f, p[2] * 1000.0f);
+    put3(node + 0x58, -c.normal[0], c.normal[2], c.normal[1]);
+    grab_values(c.closed, &open, &state);       /* fist = grab/carry, open = drop */
+    *(DWORD *)(node + 0x64) = open;
+    *(DWORD *)(node + 0x68) = state;            /* 1 closed, 2 open */
+    *(DWORD *)(node + 0x70) = 100;
 
     if (cfg_log_nodes && part == 0) {
-        static DWORD last;   /* at most ~10 lines/s */
-        DWORD now = GetTickCount();
-        if (now - last >= 100) {
-            last = now;
-            dbg("node alt=%d R=%d open=%lu state=%lu pos=(%.3f %.3f %.3f) tilt=(%.2f %.2f) roll=%.2f",
-                alt, (GetAsyncKeyState(cfg_rotate_vk) & 0x8000) != 0,
-                *(DWORD *)(node + 0x64), *(DWORD *)(node + 0x68), x, depth, up, tx, tu, roll);
-            {   /* game-side hand state: CSixensePlayerInput @ 0x10A62A78 */
-                BYTE *pi = (BYTE *)VA(0x10A62A78);
-                __try {
-                    dbg("   game: f6b0=%d f75d=%d f2e6=%d open760=%d nrm=(%.2f %.2f %.2f) rot=(%.2f %.2f %.2f) pos680=(%.2f %.2f %.2f)",
-                        pi[0x6B0], pi[0x75D], pi[0x2E6], *(int *)(pi + 0x760),
-                        *(float *)(pi + 0x68C), *(float *)(pi + 0x690), *(float *)(pi + 0x694),
-                        *(float *)(pi + 0x6A4), *(float *)(pi + 0x6A8), *(float *)(pi + 0x6AC),
-                        *(float *)(pi + 0x680), *(float *)(pi + 0x684), *(float *)(pi + 0x688));
-                } __except (EXCEPTION_EXECUTE_HANDLER) { dbg("   game: read failed"); }
-            }
+        static DWORD last;                      /* at most ~10 lines/s */
+        if (GetTickCount() - last >= 100) {
+            BYTE *pi = (BYTE *)VA(0x10A62A78);  /* CSixensePlayerInput */
+            last = GetTickCount();
+            dbg("cam closed=%d open=%d sent=%lu/%lu hand=(%.3f %.3f %.3f) n=(%.2f %.2f %.2f)",
+                c.closed, c.openness, open, state, c.hand[0], c.hand[1], c.hand[2],
+                c.normal[0], c.normal[1], c.normal[2]);
+            __try {
+                dbg("   game: f6b0=%d f75d=%d open760=%d armed=%d rot=(%.2f %.2f %.2f) pos680=(%.2f %.2f %.2f)",
+                    pi[0x6B0], pi[0x75D], *(int *)(pi + 0x760), *(BYTE *)VA(0x10A63E96),
+                    *(float *)(pi + 0x6A4), *(float *)(pi + 0x6A8), *(float *)(pi + 0x6AC),
+                    *(float *)(pi + 0x680), *(float *)(pi + 0x684), *(float *)(pi + 0x688));
+            } __except (EXCEPTION_EXECUTE_HANDLER) { dbg("   game: read failed"); }
         }
     }
     return 0;
@@ -288,6 +359,8 @@ static int install_fake_pipeline(void)
     g_gesture_vtbl[12] = (void *)gesture_stub12; g_gesture_vtbl[13] = (void *)gesture_stub13;
     g_gesture_vtbl[14] = (void *)gesture_stub14;
     *(void **)(obj + OFF_GESTURE_PTR) = &g_gesture;
+    *(DWORD *)(obj + OFF_IMAGE_W) = IMAGE_W;
+    *(DWORD *)(obj + OFF_IMAGE_H) = IMAGE_H;
 
     *slot = (void **)obj;
     dbg("fake gesture pipeline installed");
@@ -307,26 +380,11 @@ static void load_config(void)
 {
     char ini[MAX_PATH];
     sprintf(ini, "%s\\nocam_hand.ini", g_dir);
-    cfg_move_scale  = ini_f(ini, "move_scale",  cfg_move_scale);
-    cfg_depth_step  = ini_f(ini, "depth_step",  cfg_depth_step);
-    cfg_tilt_scale  = ini_f(ini, "tilt_scale",  cfg_tilt_scale);
-    cfg_roll_step   = ini_f(ini, "roll_step",   cfg_roll_step);
-    cfg_rest_depth  = ini_f(ini, "rest_depth",  cfg_rest_depth);
-    cfg_hand_always = GetPrivateProfileIntA("hand", "hand_always", cfg_hand_always, ini);
     cfg_log_nodes   = GetPrivateProfileIntA("hand", "log_nodes",   cfg_log_nodes,   ini);
-    {   /* rotate_key: a letter/digit (e.g. R) or a virtual-key number (16 = Shift) */
-        char k[16];
-        GetPrivateProfileStringA("hand", "rotate_key", "R", k, sizeof k, ini);
-        if (k[0] && !k[1] && ((k[0] >= 'A' && k[0] <= 'Z') || (k[0] >= '0' && k[0] <= '9'))) cfg_rotate_vk = k[0];
-        else if (k[0] >= 'a' && k[0] <= 'z' && !k[1]) cfg_rotate_vk = k[0] - 32;
-        else if (atoi(k) > 0) cfg_rotate_vk = atoi(k);
-    }
-    cfg_alt_open = GetPrivateProfileIntA("hand", "alt_open", cfg_alt_open, ini);
     cfg_hold_open = GetPrivateProfileIntA("hand", "hold_openness", cfg_hold_open, ini);
-    if (GetPrivateProfileIntA("hand", "invert_x", 0, ini))      sx_move = -sx_move;
-    if (GetPrivateProfileIntA("hand", "invert_y", 0, ini))      sy_move = -sy_move;
-    if (GetPrivateProfileIntA("hand", "invert_tilt_x", 0, ini)) sx_tilt = -sx_tilt;
-    if (GetPrivateProfileIntA("hand", "invert_tilt_y", 0, ini)) sy_tilt = -sy_tilt;
+    cfg_camera_timeout = GetPrivateProfileIntA("hand", "camera_timeout_ms", cfg_camera_timeout, ini);
+    cfg_toggle_grab = GetPrivateProfileIntA("hand", "toggle_grab", cfg_toggle_grab, ini);
+    cfg_tip_height  = ini_f(ini, "tip_height",  cfg_tip_height);
 }
 
 /* --------------------------------------------------------- export glue */
@@ -339,13 +397,13 @@ __declspec(dllexport) int sixenseInit(void)
     sixenseInit_t real = (sixenseInit_t)GetProcAddress(g_real, "sixenseInit");
     if (!done) {
         done = 1;
-        g_client = (BYTE *)GetModuleHandleA("client_sixense.dll");
+        if (!g_client) g_client = (BYTE *)GetModuleHandleA("client_sixense.dll");
         dbg("sixenseInit: client_sixense.dll at %p", g_client);
+        apply_mem_patches();                       /* no-op if DllMain did it */
         if (g_client) {
             __try { install_fake_pipeline(); }
             __except (EXCEPTION_EXECUTE_HANDLER) { dbg("install_fake_pipeline crashed: %08lx", GetExceptionCode()); }
         }
-        CreateThread(NULL, 0, input_thread, NULL, 0, NULL);
     }
     return real ? real() : -1;
 }
@@ -362,10 +420,15 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID r)
         sprintf(path, "%s\\nocam_hand.log", g_dir);
         g_log = fopen(path, "w");
         load_config();
-        hand_reset();
+        test_init();
         sprintf(path, "%s\\sixense_real.dll", g_dir);
         g_real = LoadLibraryA(path);
         dbg("nocam_hand loaded; real sixense: %p", g_real);
+        /* We are a static import of client_sixense.dll: it is already mapped
+           and rebased, but none of its code has run yet. */
+        g_client = (BYTE *)GetModuleHandleA("client_sixense.dll");
+        dbg("DllMain: client_sixense.dll at %p", g_client);
+        apply_mem_patches();
     }
     return TRUE;
 }

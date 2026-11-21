@@ -1,0 +1,4 @@
+wait 3000
+cmd cvarlist sixense_intel
+wait 1500
+quit

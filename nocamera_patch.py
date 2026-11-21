@@ -12,6 +12,8 @@ Usage
 What it patches
 ---------------
 portal2_sixense/bin/client_sixense.dll  (camera requirement)
+  The file itself is left original: the proxy sixense.dll applies A-D, F to
+  the loaded image (in memory) before the game code runs.
   Every Intel pipeline's vt+0x40 returns its PXC session, which is NULL when
   the Intel Perceptual runtime/camera is absent; creating a pipeline then
   dereferences NULL (0x10402B87, camera-frame-rate branch). So pipelines are
@@ -22,6 +24,7 @@ portal2_sixense/bin/client_sixense.dll  (camera requirement)
     C  0x103FFA52  "create pipeline if missing" does nothing
     D  0x103EC2C0  camera-present check always true -> no "Connect Senz3D
                    camera" dialog / forced pause
+    F  0x103FEFFF  frame-rate change never recreates the pipeline
 
 bin/vstdlib.dll  (crash on CPUs with many threads - not camera related)
   CThreadPool::Start sizes an "all cores" pool as m_nLogicalProcessors. On a
@@ -54,7 +57,11 @@ def _game_dir():
 
 GAME = os.path.normpath(_game_dir())
 
-TARGETS = {
+# Camera patches A-D, F. They are NOT written to disk any more: the proxy
+# sixense.dll (hand/nocam_hand.c, g_mem_patches) applies the same bytes to the
+# loaded image. Kept here to recognise and undo files patched by older versions
+# and for --status.
+CLIENT = {
     "client_sixense.dll": {
         "path": os.path.join(GAME, "portal2_sixense", "bin", "client_sixense.dll"),
         "sha256": "a0b7e7e1360579af2f7b8028fad6fbbd2703a405eb0c39b881fe321f05c01026",
@@ -75,7 +82,10 @@ TARGETS = {
              "0F 84 2B 01 00 00",    # je  103FF130 (only if no pipeline)
              "E9 2C 01 00 00 90"),   # jmp 103FF130 (always)
         ],
-    },
+    }
+}
+
+TARGETS = {
     "vstdlib.dll": {
         "path": os.path.join(GAME, "bin", "vstdlib.dll"),
         "sha256": "0ec1dd55d8a2ec3a86c5be61e836ab99a01e27191b030522d9c226e0c5cd32cf",
@@ -205,10 +215,36 @@ def main():
             print("%-18s %-46s VA %#x  (relocs disabled: %d)" % (dll, name, va, nrel))
         with open(path, "wb") as f:
             f.write(data)
+    client_original(mode)
     hand_proxy(mode)
     autoexec(mode)
     if mode == "--apply":
         print("Done.")
+
+
+def client_original(mode):
+    """client_sixense.dll must be the untouched original; the proxy patches it in memory."""
+    t = CLIENT["client_sixense.dll"]
+    path, backup = t["path"], t["path"] + ".orig"
+    if not os.path.isfile(path):
+        sys.exit("client_sixense.dll not found at %s" % path)
+    data = bytearray(open(path, "rb").read())
+    states = [site_state(data, va, o, p) for _, va, o, p in parse(t)]
+    if mode == "--status":
+        for (name, va, _, _), st in zip(parse(t), states):
+            where = "file original, patched in memory by proxy" if st == "original" else "file " + st
+            print("%-18s %-46s %#x  %s" % ("client_sixense.dll", name, va, where))
+        return
+    if all(st == "original" for st in states):
+        if mode == "--apply":
+            print("client_sixense.dll: original file (camera patches are applied in memory)")
+        return
+    if os.path.isfile(backup):        # left over from the old on-disk patching
+        shutil.copy2(backup, path)
+        os.remove(backup)
+        print("client_sixense.dll: on-disk patches removed, original restored")
+    else:
+        print("client_sixense.dll: patched file but no .orig backup - use Steam 'verify files'")
 
 
 # Fake-hand proxy: our sixense.dll (built from hand/) replaces the mod's

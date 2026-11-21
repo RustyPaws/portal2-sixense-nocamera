@@ -12,3 +12,10 @@ hand/out/
 *.log
 
 __pycache__/
+
+# webcam tracker
+tracker/.venv/
+tracker/models/
+tracker/*.log
+
+tracker/settings.json

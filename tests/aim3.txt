@@ -1,0 +1,27 @@
+# Does the palm position move the cursor (tip offset fixed at +4.5 cm)?
+log 0
+jitter 0.0005
+tip 0 0.045 0
+upper 0 0.03 0
+cmd script_execute nocam_test
+wait 7000
+mark centre
+wait 1000
+cmd jpeg
+wait 300
+mark palm right 10 cm
+hand 0.10 0 0.45
+wait 1200
+cmd jpeg
+wait 300
+mark palm up 10 cm
+hand 0 0.10 0.45
+wait 1200
+cmd jpeg
+wait 300
+mark palm closer 15 cm
+hand 0 0 0.30
+wait 1200
+cmd jpeg
+wait 300
+quit

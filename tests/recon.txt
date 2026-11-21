@@ -1,0 +1,8 @@
+# Smoke test: harness works, list props around the player.
+log 1000
+wait 3000
+cmd script_execute nocam_test
+cmd script TestPlayer()
+cmd script TestList()
+wait 1000
+quit

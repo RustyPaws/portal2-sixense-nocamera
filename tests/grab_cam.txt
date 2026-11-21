@@ -1,0 +1,46 @@
+# End-to-end grab through the real cam code path: cube in front, close, lift, open.
+source cam
+log 250
+cmd script_execute nocam_test
+wait 11000
+cmd script TestPlace("scaled_cube_dropper_1-cube_dropper_box", 55, 20)
+wait 1500
+cmd script TestLook("scaled_cube_dropper_1-cube_dropper_box")
+wait 800
+cmd jpeg
+cmd script TestMark("scaled_cube_dropper_1-cube_dropper_box")
+mark open hand only - must not grab
+wait 1000
+cmd script TestStill("open hand", "scaled_cube_dropper_1-cube_dropper_box")
+expect held 0
+mark close
+fist 1
+wait 1200
+cmd jpeg
+mark lift (hand up 6 cm)
+hand 0 0.06 0.45
+wait 1200
+cmd jpeg
+cmd script TestMoved("grab + lift", "scaled_cube_dropper_1-cube_dropper_box")
+expect held 1
+mark tilt the fist (rotate the held cube)
+cmd script TestMarkAng("scaled_cube_dropper_1-cube_dropper_box")
+normal 0.5 0 -0.866
+wait 600
+normal 0.5 0.3 -0.81
+wait 900
+cmd jpeg
+cmd script TestTurned("tilt rotates", "scaled_cube_dropper_1-cube_dropper_box")
+expect held 1
+normal 0 0 -1
+wait 500
+mark open - drop
+fist 0
+wait 1000
+expect held 0
+mark move the open hand: nothing may be picked up
+hand -0.08 0.0 0.45
+wait 1200
+cmd jpeg
+expect held 0
+quit

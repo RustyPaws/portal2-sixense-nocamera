@@ -1,0 +1,35 @@
+# Grab the dispenser cube (no teleport), neutral aim, then fingertip cvar check.
+log 250
+jitter 0.0005
+tip 0 0.045 0
+upper 0 0.03 0
+cmd script_execute nocam_test
+wait 11000
+cmd script TestPlayer()
+cmd script TestPlace("scaled_cube_dropper_1-cube_dropper_box", 55, 20)
+wait 1500
+cmd script TestWhere("scaled_cube_dropper_1-cube_dropper_box")
+cmd script TestLook("scaled_cube_dropper_1-cube_dropper_box")
+wait 800
+cmd jpeg
+wait 300
+mark close (state 1 = closed: starts the grab)
+open 0 1
+wait 600
+mark held: state 2 / openness 2 (keeps holding, allows rotation)
+open 2 2
+wait 400
+cmd jpeg
+mark lift
+hand 0 0.05 0.40
+wait 300
+hand 0 0.10 0.35
+wait 800
+cmd jpeg
+cmd script TestWhere("scaled_cube_dropper_1-cube_dropper_box")
+wait 300
+mark open
+open 100 2
+wait 1000
+cmd script TestWhere("scaled_cube_dropper_1-cube_dropper_box")
+quit

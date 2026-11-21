@@ -1,0 +1,30 @@
+# Viewmodel aim: which tip/upper offsets make the portal gun point forward?
+log 0
+jitter 0.0005
+cmd script_execute nocam_test
+wait 7000
+cmd sixense_intel_grab_enabled
+cmd sixense_intel_use_fingertip
+cmd sixense_intel_grab_pos_min
+cmd sixense_intel_hand_close_time
+cmd sixense_intel_portal_fire_hand_closed
+cmd sixense_intel_grab_pitch_offset_angle
+cmd sixense_intel_1to1_rot_req_openness
+cmd sixense_intel_firing_mode
+mark default (tip up)
+wait 1000
+cmd jpeg
+wait 500
+mark tip towards camera
+tip 0 0 -0.08
+upper 0 0 -0.05
+wait 1500
+cmd jpeg
+wait 500
+mark tip away from camera
+tip 0 0 0.08
+upper 0 0 0.05
+wait 1500
+cmd jpeg
+wait 500
+quit

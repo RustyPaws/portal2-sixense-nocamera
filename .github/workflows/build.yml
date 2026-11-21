@@ -1,0 +1,76 @@
+# Builds the proxy sixense.dll and packs a ready-to-use zip.
+# Every push / pull request: the zip is attached to the run as an artifact.
+# Tag v* (e.g. `git tag v1.0 && git push origin v1.0`): a GitHub release with the zip.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sixense.dll (x86, MSVC)
+        shell: cmd
+        run: hand\build.bat
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check Python scripts compile
+        run: python -m py_compile nocamera_patch.py tracker/tracker.py tools/hand_test.py
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ver = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "dev-" + "${{ github.sha }}".Substring(0, 7) }
+          $name = "portal2-sixense-nocamera-$ver"
+          $dst = "dist/$name"
+          # keep the repo layout: nocamera_patch.py expects hand/out/sixense.dll etc.
+          $files = @(
+            "hand/out/sixense.dll", "hand/nocam_hand.ini", "game/autoexec.cfg", "nocamera_patch.py",
+            "tracker/tracker.py", "tracker/run.bat", "tracker/setup.bat",
+            "README.md", "README.ru.md"
+          )
+          foreach ($f in $files) {
+            New-Item -ItemType Directory -Force (Split-Path "$dst/$f") | Out-Null
+            Copy-Item $f "$dst/$f"
+          }
+          Compress-Archive -Path $dst -DestinationPath "dist/$name.zip"
+          "ZIP_NAME=$name" | Out-File -Append $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: dist/${{ env.ZIP_NAME }}.zip
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/*.zip \
+            --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes

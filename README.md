@@ -1,16 +1,21 @@
 # Portal 2 Sixense Perceptual Pack — play without the Senz3D camera
 
+**По-русски, просто и по шагам: [README.ru.md](README.ru.md)**
+
 The Perceptual Pack expects a Creative Senz3D depth camera and the Intel
 Perceptual Computing runtime. Without them the game crashes at startup or nags
 "Connect Senz3D camera" and freezes the player. This project:
 
-1. **Byte-patches** `client_sixense.dll` so the game never creates the Intel
-   camera pipelines and never asks for the camera.
+1. **Patches `client_sixense.dll` in memory** (the file on disk stays original)
+   so the game never creates the Intel camera pipelines and never asks for the
+   camera. The proxy `sixense.dll` does this from its `DllMain`, before any of the
+   client code runs.
 2. **Fixes a crash on CPUs with many threads** (≥ 32 logical CPUs) in
    `vstdlib.dll`; this is not camera related.
 3. **Fakes the hand** the camera would track: a proxy `sixense.dll` feeds the
-   game's own camera code a virtual hand driven by keyboard and mouse. Grabbing,
-   moving, rotating and scaling objects and tweaking portals then work as designed.
+   game's own camera code the hand an ordinary webcam sees (`tracker/`, MediaPipe).
+   Grabbing, moving, rotating and scaling objects and tweaking portals then work
+   as designed.
 
 No game files are included. The patcher edits your installed copy and keeps
 backups.
@@ -22,18 +27,23 @@ backups.
 | Move / look / jump             | WASD / mouse / Space                    |
 | Fire portals                   | Left / right click                      |
 | Normal "use" pickup            | E                                       |
-| **Grab with the hand**         | hold **Alt** (mouse moves the hand, view stays still) |
-| Hand closer / further          | Alt + mouse wheel                       |
-| **Rotate held object**         | hold **Alt + R** + mouse                |
-| Roll                           | Alt + R + mouse wheel                   |
-| Scaling mode / portal tweak    | V / G (the game's own binds), then Alt as above |
+| **Grab with the hand**         | make a **fist** in front of the webcam (`tracker\run.bat`) |
+| Move the held object           | move the fist; closer to the camera = further away |
+| **Rotate held object**         | tilt the fist (relative to how it was when you grabbed) |
+| Drop                           | open the hand                           |
+| Scaling mode / portal tweak    | V / G (the game's own binds), then the hand as above |
 
-Release Alt to open the hand (drop) and return to normal mouse-look.
+The portal gun follows the hand. Without the tracker running no hand is visible.
 
 ## Install
 
 Requirements: Python 3 (`pip install pefile capstone` only for `tools/`),
-Visual Studio 2022 with the C++ workload (to build the proxy DLL).
+Visual Studio 2019/2022 (any edition) with the C++ workload to build the proxy
+DLL - or take the ready zip from GitHub Releases and skip `handuild.bat`.
+
+CI (`.github/workflows/build.yml`) builds the DLL on every push and pull request
+(the zip is attached to the run) and publishes a release for every `v*` tag:
+`git tag v1.0 && git push origin v1.0`.
 
 ```bat
 hand\build.bat                       :: builds hand\out\sixense.dll (32-bit)
@@ -50,11 +60,11 @@ What gets installed:
 
 | File (in the game folder)                    | Change                                   | Undo |
 | -------------------------------------------- | ---------------------------------------- | ---- |
-| `portal2_sixense/bin/client_sixense.dll`     | patches A–D, F                           | `.orig` backup |
+| `portal2_sixense/bin/client_sixense.dll`     | none on disk; A–D, F applied in memory by the proxy | — (an old patched file is restored from `.orig`) |
 | `bin/vstdlib.dll`                            | patch E                                  | `.orig` backup |
 | `portal2_sixense/bin/sixense.dll`            | replaced by the proxy                    | original kept as `sixense_real.dll` |
 | `portal2_sixense/bin/nocam_hand.ini`         | fake-hand settings (never overwritten)   | — |
-| `portal2_sixense/cfg/autoexec.cfg`           | `sixense_intel_enabled 1`, unbinds Alt and R | removed on revert |
+| `portal2_sixense/cfg/autoexec.cfg`           | `sixense_intel_enabled 1`                | removed on revert |
 
 ## Tuning — `portal2_sixense/bin/nocam_hand.ini`
 
@@ -62,24 +72,20 @@ Read at game start.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `invert_x`, `invert_y` | 0 | flip hand movement axes |
-| `invert_tilt_x`, `invert_tilt_y` | 0 | flip rotation axes |
-| `move_scale` | 0.0006 | metres of hand movement per mouse count |
-| `depth_step` | 0.03 | metres per wheel notch |
-| `tilt_scale`, `roll_step` | 0.004, 0.15 | radians per mouse count / wheel notch while rotating |
-| `rest_depth` | 0.45 | resting hand distance from the virtual camera |
-| `rotate_key` | R | rotate modifier: a letter, or a virtual-key number (16 = Shift) |
-| `alt_open` | 1 | every Alt grab can rotate (0 = old behaviour) |
-| `hold_openness` | 2 | openness reported while holding (see notes) |
-| `hand_always` | 1 | show an open hand while Alt is up |
+| `hold_openness` | 2 | openness reported while carrying (game: scaled to 1 = holds and can rotate) |
 | `log_nodes` | 0 | log hand + game state to `nocam_hand.log` (~10 lines/s) |
+| `tip_height` | 0.045 | fingertip height above the palm (m). It aims the portal gun; 0.08 points it at the ceiling |
+| `toggle_grab` | 0 | 0 = hold to carry. 1 = the original toggle: close = grab, open = keep holding and rotate, close again = drop |
+| `camera_timeout_ms` | 300 | webcam tracker data older than this is ignored |
 
 ## Patches
 
-All VAs are at the DLL's preferred base `0x10000000`. Patched instructions that
-contained absolute addresses also get their base relocation disabled. Otherwise
-Windows "fixes up" the new bytes when the DLL is rebased, which caused a real
-crash during development.
+All VAs are at the DLL's preferred base `0x10000000`. A–D, F live in
+`g_mem_patches` in `hand/nocam_hand.c`: the proxy rebases each address to where
+Windows actually loaded the client, checks the original bytes (allowing for
+already-rebased absolute addresses) and writes all five or none. E is written to
+`vstdlib.dll` on disk; there the patched instruction's base relocation is
+disabled, otherwise Windows "fixes up" the new bytes when the DLL is rebased.
 
 | Id | DLL | VA | Change | Why |
 | -- | --- | -- | ------ | --- |
@@ -107,8 +113,8 @@ Sixense/Intel initialisation:
   returns). The game's frame handler `0x103FEC10` calls `QueryNodeData`
   (vtable slot 7, stdcall `(this, user, label, GeoNode*)`) for primary/secondary
   hand (`0x40000`/`0x80000`), fingertip (`|6`) and upper hand (`|7`).
-* A low-level mouse hook (`WH_MOUSE_LL`) swallows mouse input while Alt is held
-  and turns it into hand position, depth, tilt and roll.
+* The hand comes from the shared memory block `nocam_hand` that
+  `tracker/tracker.py` writes (layout in both files). No tracker = no hand.
 
 GeoNode fields the game reads (0x80 bytes):
 
@@ -135,6 +141,50 @@ Other addresses that are useful when extending this:
 * Per-frame camera nag `0x103FFC18`.
 * PXC loader `0x10448F80`.
 * Engine client `0x109EAA84`: `vt+0x1B0` executes a client command.
+
+## How grabbing works in the game
+
+Reverse engineered in `client_sixense.dll`; the proxy depends on all of it:
+
+* The frame handler (`0x103FEC10`, `this` = pipeline + `0x1F80`) needs the depth
+  image size at pipeline + `0x2940/0x2944`. If it is 0, the "fingertip inside the
+  image" flag `0x10A63B10` stays 0 and **nothing can ever be grabbed**. The proxy
+  sets 320×240, which is also what its image coordinates assume.
+* The game only takes a new hand frame when the position changed. A real camera
+  always jitters; the proxy alternates the position by ±0.3 mm each frame.
+* `0x103FBAD1`: an open hand (state 2, averaged openness above a threshold) arms
+  the grab (`0x10A63E96`). A closed hand (state 1) for longer than
+  `sixense_intel_hand_close_time` sets `CSixensePlayerInput+0x75D`, and
+  `0x1040098E` then presses USE (`IN_USE`, `0x20`) once. In Portal USE toggles:
+  it picks up or drops.
+* A held object rotates 1:1 with the palm normal only with state 2 and openness
+  above `sixense_intel_1to1_rot_req_openness`.
+* The portal gun aims along palm → fingertip (`sixense_intel_use_fingertip 1`).
+  The palm position moves the gun model 1:1.
+
+Hold to carry (default): a closed hand reports state 1 until the player holds
+something (`GetHeldObject` `0x103B7320` of `GetLocalPlayer` `0x1008BC60`), then
+2/2 so tilting rotates. On opening, the proxy re-arms and pulses "closed" until
+the object is dropped. Opening the hand never grabs anything.
+
+## Testing (`tools/hand_test.py`)
+
+Starts `portal2.exe` directly (the Steam client must be running), lets the proxy
+play a hand script and prints the results. A run takes about 20 s:
+
+```bat
+python tools\hand_test.py tests\grab_cam.txt     :: webcam path: grab, lift, tilt, drop
+```
+
+* The script language is described in `hand/nocam_test.inc.c`: hand position,
+  normal, openness, `source cam` (feed the real webcam code path), `fist 0|1`,
+  console commands, `expect held 0|1`.
+* VScript helpers (`tests/nocam_test.nut`): place/look at an entity, PASS/FAIL
+  checks for movement and rotation.
+* `cmd jpeg` takes screenshots; the runner combines them into
+  `portal2_sixense/bin/nocam_test_sheet.jpg`.
+* Output: `nocam_test.log` (hand + game state, PASS/FAIL) and console lines
+  containing `TEST`.
 
 ## tools/
 
